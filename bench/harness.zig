@@ -6,9 +6,10 @@ const reference = @import("reference.zig");
 const ALIGN: std.mem.Alignment = .fromByteUnits(generic.CACHE_LINE_SIZE);
 
 pub const Logical = struct {
-    weights: []u8,  // weight_count codes of `scheme.weight`, packed like the file (4-bit: element 2k in lo nibble)
-    scales: []u8,   // weight_count / `scheme.block` codes of `scheme.scale`; empty for plain schemes
-    expected: []u8, // weight_count codes of `output_t`: decode * scale -> encode
+    weights: []u8,          // weight_count values of `scheme.weight`, packed like the file (4-bit: element 2k in lo nibble)
+    scales: []u8,           // weight_count / `scheme.block` values of `scheme.scale`; empty for plain schemes
+    expected: []u8,         // weight_count values of `out_scheme.weight`: decode * scale -> (out scale) -> encode
+    expected_scales: []u8,  // weight_count / `out_scheme.block` values of `out_scheme.scale`; empty for plain schemes
     weight_count: usize,
 };
 
@@ -21,27 +22,28 @@ const Trial = struct {
 pub const Args = struct {
     size_filter: ?[]const u8,
     scheme: generic.Scheme,
-    output_t: generic.Dtype,
+    out_scheme: generic.Scheme,
 };
 
-pub fn parseArgs(args: std.process.Args.Iterator) Args { // {scheme} [output_t (default f32)] [size]
+pub fn parseArgs(args: std.process.Args.Iterator) Args { // {scheme} [out_scheme (default f32)] [size]
     var it = args;
     _ = it.skip();
     const scheme_name = it.next() orelse @panic("Args: missing scheme (nvfp4|mxfp4|i4|f8e4m3|f16|bf16|f32)");
     const scheme = std.meta.stringToEnum(generic.Scheme, scheme_name) orelse @panic("Args: unknown scheme");
 
-    var output_t: generic.Dtype = .f32;
+    var out_scheme: generic.Scheme = .f32;
     var size_filter = it.next();
-    if (size_filter) |name| if (std.meta.stringToEnum(generic.Dtype, name)) |dtype| {
-        output_t = dtype;
+    if (size_filter) |name| if (std.meta.stringToEnum(generic.Scheme, name)) |out_name| {
+        out_scheme = out_name;
         size_filter = it.next();
     };
-    return .{ .size_filter = size_filter, .scheme = scheme, .output_t = output_t };
+    return .{ .size_filter = size_filter, .scheme = scheme, .out_scheme = out_scheme };
 }
 
 pub fn run(comptime Kernel: type, comptime name: []const u8, size_filter: ?[]const u8) !void { // harness module's main
     // Pipeline: [generateLogical() -> Prepare() -> VERIFY -> runTrial() * TRIAL_COUNT -> SUMMARY] * SIZES
-    const out_t = comptime generic.Dtype.RECIPE.get(Kernel.OUTPUT);
+    const out_recipe = comptime generic.Scheme.RECIPE.get(Kernel.OUTPUT);
+    const out_t = comptime generic.Dtype.RECIPE.get(out_recipe.weight);
     pinCpu(generic.PIN_CPU);
     const tsc_hz = calibrateTscHz();
     std.debug.print("{s}: {t} -> {t}, cpu {d}, tsc {d:.4} GHz, trials {d} x >= {d} s, sleep {d} s\n", .{
@@ -65,9 +67,13 @@ pub fn run(comptime Kernel: type, comptime name: []const u8, size_filter: ?[]con
         const logical = try generateLogical(Kernel.SCHEME, Kernel.OUTPUT, allocator, size.weight_count);
         const kernel = try Kernel.Prepare(allocator, &logical);
         const out = try allocator.alignedAlloc(u8, ALIGN, size.weight_count * out_t.bits / 8);
+        const out_s: []u8 = if (logical.expected_scales.len > 0)
+            try allocator.alignedAlloc(u8, ALIGN, logical.expected_scales.len)
+        else
+            try allocator.alloc(u8, 0);
 
         // VERIFY + pre fault `out`
-        Kernel.Run(&kernel, out);
+        Kernel.Run(&kernel, out, out_s);
         for (0..size.weight_count) |weight_idx| {
             const want = reference.readCode(out_t, logical.expected, weight_idx);
             const got = reference.readCode(out_t, out, weight_idx);
@@ -75,6 +81,18 @@ pub fn run(comptime Kernel: type, comptime name: []const u8, size_filter: ?[]con
                 "{s} mismatch @{d}: got 0x{x} vs want 0x{x}",
                 .{ name, weight_idx, got, want },
             );
+        }
+        if (out_recipe.scale) |c_scale_t| {
+            const scale_t = comptime generic.Dtype.RECIPE.get(c_scale_t);
+            const scale_count = size.weight_count / out_recipe.block;
+            for (0..scale_count) |scale_idx| {
+                const want = reference.readCode(scale_t, logical.expected_scales, scale_idx);
+                const got = reference.readCode(scale_t, out_s, scale_idx);
+                if (!reference.isCodeEqual(scale_t, want, got)) std.debug.panic(
+                    "{s} scale mismatch @{d}: got 0x{x} vs want 0x{x}",
+                    .{ name, scale_idx, got, want },
+                );
+            }
         }
         const out_hash = hashOutput(out_t, out, size.weight_count);
 
@@ -90,7 +108,7 @@ pub fn run(comptime Kernel: type, comptime name: []const u8, size_filter: ?[]con
             if (trial_done_count > 0) sleep(generic.TRIAL_SLEEP_NS);
             trial_done_count += 1;
 
-            const trial = runTrial(Kernel, &kernel, out, batch_rep_count, tsc_hz);
+            const trial = runTrial(Kernel, &kernel, out, out_s, batch_rep_count, tsc_hz);
 
             // REPORT trial
             const weight_total: f64 = @floatFromInt(trial.rep_count * size.weight_count);
@@ -126,6 +144,7 @@ fn runTrial(
     comptime Kernel: type,
     kernel: *const Kernel,
     out: []u8,
+    out_s: []u8,
     batch_rep_count: u64,
     tsc_hz: f64,
 ) Trial {
@@ -139,8 +158,9 @@ fn runTrial(
     var tsc_now = tsc_start;
     while (tsc_now - tsc_start < deadline_ticks) {
         for (0..batch_rep_count) |_| {
-            Kernel.Run(kernel, out);
+            Kernel.Run(kernel, out, out_s);
             clobberMemory(out);
+            clobberMemory(out_s);
         }
         rep_count += batch_rep_count;
         tsc_now = tscEnd();
@@ -156,20 +176,22 @@ fn runTrial(
 
 fn generateLogical(
     comptime scheme: generic.Scheme,
-    comptime output_t: generic.Dtype,
+    comptime out_scheme: generic.Scheme,
     allocator: std.mem.Allocator,
     weight_count: usize,
 ) !Logical {
-    // Pipeline: WEIGHTS -> SCALES -> EXPECTED (same prng order as llama.cpp bench)
+    // Pipeline: WEIGHTS -> SCALES -> VALUES -> (out scales) -> EXPECTED (same prng order as llama.cpp bench)
     const recipe = comptime generic.Scheme.RECIPE.get(scheme);
     const weight_t = comptime generic.Dtype.RECIPE.get(recipe.weight);
-    const out_t = comptime generic.Dtype.RECIPE.get(output_t);
+    const out_recipe = comptime generic.Scheme.RECIPE.get(out_scheme);
+    const out_t = comptime generic.Dtype.RECIPE.get(out_recipe.weight);
     std.debug.assert(weight_count % recipe.block == 0);
+    std.debug.assert(weight_count % out_recipe.block == 0);
 
     var prng: std.Random.DefaultPrng = .init(generic.SEED);
     const random = prng.random();
 
-    // WEIGHTS: random codes, nan|inf -> 0
+    // WEIGHTS: random values, nan|inf -> 0
     const weights = try allocator.alignedAlloc(u8, ALIGN, weight_count * weight_t.bits / 8);
     @memset(weights, 0);
     for (0..weight_count) |weight_idx| {
@@ -178,7 +200,7 @@ fn generateLogical(
         reference.writeCode(weight_t, weights, weight_idx, if (is_finite) code else 0);
     }
 
-    // SCALES: codes in `SCALE_RANGE`
+    // SCALES: values in `SCALE_RANGE`
     var scales: []u8 = &.{};
     if (recipe.scale) |c_scale_t| {
         const scale_t = comptime generic.Dtype.RECIPE.get(c_scale_t);
@@ -191,22 +213,53 @@ fn generateLogical(
         }
     }
 
-    // EXPECTED: decode * scale -> encode (global_scale 1.0)
+    // EXPECTED: encode to out_scheme, with out scales when quantized (global_scale 1.0)
     const expected = try allocator.alignedAlloc(u8, ALIGN, weight_count * out_t.bits / 8);
     @memset(expected, 0);
-    for (0..weight_count) |weight_idx| {
-        const value = reference.decode(weight_t, reference.readCode(weight_t, weights, weight_idx));
-        const scale: f32 = if (recipe.scale) |c_scale_t| blk: {
-            const scale_t = comptime generic.Dtype.RECIPE.get(c_scale_t);
-            break :blk reference.decode(scale_t, reference.readCode(scale_t, scales, weight_idx / recipe.block));
-        } else 1.0;
-        reference.writeCode(out_t, expected, weight_idx, reference.encode(out_t, value * scale));
+    var expected_scales: []u8 = &.{};
+    if (out_recipe.scale) |c_scale_t| {
+        const scale_t = comptime generic.Dtype.RECIPE.get(c_scale_t);
+        const scale_count = weight_count / out_recipe.block;
+        expected_scales = try allocator.alignedAlloc(u8, ALIGN, scale_count * scale_t.bits / 8);
+        @memset(expected_scales, 0);
+
+        const values = try allocator.alloc(f32, weight_count);
+        for (0..weight_count) |weight_idx| {
+            const value = reference.decode(weight_t, reference.readCode(weight_t, weights, weight_idx));
+            const scale: f32 = if (recipe.scale) |c_in_scale_t| blk: {
+                const in_scale_t = comptime generic.Dtype.RECIPE.get(c_in_scale_t);
+                break :blk reference.decode(in_scale_t, reference.readCode(in_scale_t, scales, weight_idx / recipe.block));
+            } else 1.0;
+            values[weight_idx] = value * scale;
+        }
+        for (0..scale_count) |block_idx| {
+            var absmax: f32 = 0;
+            for (0..out_recipe.block) |i| absmax = @max(absmax, @abs(values[block_idx * out_recipe.block + i]));
+            const scale_code = reference.encode(scale_t, absmax / out_recipe.absmax);
+            reference.writeCode(scale_t, expected_scales, block_idx, scale_code);
+            const scale_value = reference.decode(scale_t, scale_code);
+            const inv_scale: f32 = if (scale_value == 0) 0 else 1.0 / scale_value;
+            for (0..out_recipe.block) |i| {
+                const weight_idx = block_idx * out_recipe.block + i;
+                reference.writeCode(out_t, expected, weight_idx, reference.encode(out_t, values[weight_idx] * inv_scale));
+            }
+        }
+    } else {
+        for (0..weight_count) |weight_idx| {
+            const value = reference.decode(weight_t, reference.readCode(weight_t, weights, weight_idx));
+            const scale: f32 = if (recipe.scale) |c_scale_t| blk: {
+                const scale_t = comptime generic.Dtype.RECIPE.get(c_scale_t);
+                break :blk reference.decode(scale_t, reference.readCode(scale_t, scales, weight_idx / recipe.block));
+            } else 1.0;
+            reference.writeCode(out_t, expected, weight_idx, reference.encode(out_t, value * scale));
+        }
     }
 
     return .{
         .weights = weights,
         .scales = scales,
         .expected = expected,
+        .expected_scales = expected_scales,
         .weight_count = weight_count,
     };
 }

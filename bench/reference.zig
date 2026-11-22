@@ -111,7 +111,7 @@ fn magnitudeTable(comptime format: Recipe) [magnitudeCount(format)]f64 {
 }
 
 fn magnitudeCount(comptime format: Recipe) usize {
-    const count = @as(usize, 1) << @intCast(format.bits - 1); // positive codes
+    const count = @as(usize, 1) << @intCast(format.bits - 1); // positive values
     return switch (format.expmode) {
         .fn_nan => count - 1, // S.1..1.1..1 is nan
         else => count,

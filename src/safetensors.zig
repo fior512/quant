@@ -28,39 +28,37 @@ const Header = struct { // json line
     is_inverse: bool, // global scale may be 1/x
 };
 
-
 const HEADERS = [_]Header{ // format to parse
-    .{ 
+    .{
         .layer = ".weight",
         .weight = ".weight",
         .scale = ".weight_scale",
         .global = ".weight_scale_2",
         .midpoint = null,
-        .is_inverse = false
+        .is_inverse = false,
     },
-    .{ 
+    .{
         .layer = ".weight",
         .weight = ".weight_packed",
         .scale = ".weight_scale",
         .global = ".weight_global_scale",
         .midpoint = ".weight_zero_point",
-        .is_inverse = true
+        .is_inverse = true,
     },
-    .{ 
+    .{
         .layer = "",
-        .weight = "_blocks", 
+        .weight = "_blocks",
         .scale = "_scales",
-        .global = null, 
-        .midpoint = null, 
-        .is_inverse = false
+        .global = null,
+        .midpoint = null,
+        .is_inverse = false,
     },
 };
-
 
 const Tensor = struct {
     dtype: []const u8 = "",
     shape: []const u64 = &.{},
-    data_offsets: [2]u64 = .{0, 0},
+    data_offsets: [2]u64 = .{ 0, 0 },
 };
 const Tensors = std.StringArrayHashMapUnmanaged(Tensor);
 
@@ -79,9 +77,9 @@ pub inline fn parseJson(in: std.Io.File, io: std.Io, arena: std.mem.Allocator) !
         std.json.ArrayHashMap(Tensor),
         arena,
         bytes,
-        .{ .ignore_unknown_fields = true}, // skip optional metadata
+        .{ .ignore_unknown_fields = true }, // skip optional metadata
     )).map;
-    
+
     // PARSE
     var layers: std.ArrayList(Layer) = try .initCapacity(arena, tensors.count());
     const isParsed = try arena.alloc(bool, tensors.count());
@@ -89,10 +87,18 @@ pub inline fn parseJson(in: std.Io.File, io: std.Io, arena: std.mem.Allocator) !
 
     // parse quantized
     for (tensors.keys(), tensors.values()) |name, weight| {
-        const layer = try toLayer(arena, tensors, isParsed, &reader, start, name, weight) orelse continue;
+        const layer = try toLayer(
+            arena,
+            tensors,
+            isParsed,
+            &reader,
+            start,
+            name,
+            weight,
+        ) orelse continue;
         layers.appendAssumeCapacity(layer);
     }
-    
+
     // parse unnamed
     for (tensors.keys(), tensors.values(), isParsed) |name, tensor, used| {
         if (used or std.mem.eql(u8, name, "__metadata__")) continue;
@@ -105,7 +111,11 @@ pub inline fn parseJson(in: std.Io.File, io: std.Io, arena: std.mem.Allocator) !
             .scale_offset = 0,
             .midpoint_offset = 0,
             .global_scale = 1.0,
-            .scheme = if (types.Dtype.NameToDtype(tensor.dtype)) |plain_t| types.Scheme.DtypeToScheme(plain_t) else null, // "I64" | "BOOL" | "U8" -> null
+            .scheme = if (types.Dtype.NameToDtype(
+                tensor.dtype,
+            )) |plain_t| types.Scheme.DtypeToScheme(
+                plain_t,
+            ) else null, // "I64" | "BOOL" | "U8" -> null
         });
     }
 
@@ -127,7 +137,7 @@ fn toLayer(
         }
         return null;
     };
-    const prefix = name[0..name.len - header.weight.len];
+    const prefix = name[0 .. name.len - header.weight.len];
     var name_buf: [512]u8 = undefined;
 
     // SCALE to SCHEME
@@ -139,10 +149,11 @@ fn toLayer(
     const scale_size = scale.data_offsets[1] - scale.data_offsets[0];
     const isScalar = scale_size == types.Dtype.RECIPE.get(scale_t).bits / 8;
     const scheme = if (isScalar) //TODO
-        types.Scheme.DtypeToScheme(types.Dtype.NameToDtype(weight.dtype) orelse return error.UnknownScheme) orelse return error.UnknownScheme
+        types.Scheme.DtypeToScheme(
+            types.Dtype.NameToDtype(weight.dtype) orelse return error.UnknownScheme,
+        ) orelse return error.UnknownScheme
     else
         types.Scheme.ScaleToScheme(scale_t) orelse return error.UnknownScheme;
-
 
     // SCALE LAYOUT
     if (!isScalar) {
@@ -150,10 +161,11 @@ fn toLayer(
         if (weight_size / scheme.BlockSize() * scheme.ScaleSize() != scale_size) return error.ScaleLayout;
     }
 
-
     // GLOBAL SCALE
     var global_idx: ?usize = if (isScalar) scale_idx else null;
-    if (header.global) |global_suffix| if (types.Scheme.RECIPE.get(scheme).global_scale and !isScalar) {
+    if (header.global) |global_suffix| if (types.Scheme.RECIPE.get(
+        scheme,
+    ).global_scale and !isScalar) {
         const global_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ prefix, global_suffix });
         global_idx = tensors.getIndex(global_name) orelse return error.MissingGLobalScale;
     };
@@ -164,10 +176,14 @@ fn toLayer(
         if (header.is_inverse and !isScalar) global_scale = 1.0 / global_scale; // turn back on
         isParsed[idx] = true;
     }
-    
+
     // MIDPOINT
     if (header.midpoint) |midpoint_suffix| {
-        const midpoint_name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ prefix, midpoint_suffix });
+        const midpoint_name = try std.fmt.bufPrint(
+            &name_buf,
+            "{s}{s}",
+            .{ prefix, midpoint_suffix },
+        );
         if (tensors.getIndex(midpoint_name) != null) return error.MidpointLayout; // I32 packed along rows not handled
     }
     const midpoint_offset: u64 = 0; // 0=RTN
@@ -178,13 +194,13 @@ fn toLayer(
     const weight_bits = types.Dtype.RECIPE.get(types.Scheme.RECIPE.get(scheme).weight).bits;
     var row_count: u64 = 1;
     for (shape[0 .. shape.len - 1]) |dim| row_count *= dim;
-    shape[shape.len - 1] = weight_size * 8 / weight_bits / row_count; // storage-agnostic: U8 | I32 | F8_E4M3
+    shape[shape.len - 1] = weight_size * 8 / weight_bits / row_count; // agnostic storage : U8 | I32 | F8_E4M3
 
     isParsed[scale_idx] = true;
     isParsed[tensors.getIndex(name).?] = true;
 
     return .{
-        .name = try std.fmt.allocPrint(arena, "{s}{s}", .{prefix, header.layer }),
+        .name = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, header.layer }),
         .dtype = weight.dtype,
         .shape = shape,
         .weight_offset = start + weight.data_offsets[0],

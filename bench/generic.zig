@@ -13,19 +13,19 @@ pub const SIZES = [_]Size{ // working set = in + out; shown for nvfp4 -> f32 (0.
     .{ .label = "DRAM", .weight_count = 1 << 26 }, //    36 MiB in + 256 MiB out = 292 MiB
 };
 
-// src types, taken from `dequant.dequant` signature -> bench and src cannot drift
-pub const Scheme = @typeInfo(@TypeOf(dequant.dequant)).@"fn".param_types[0].?;
-pub const Dtype = @typeInfo(@TypeOf(dequant.dequant)).@"fn".param_types[1].?;
+// src types, re-exported through `dequant` -> bench and src cannot drift
+pub const Scheme = dequant.types.Scheme;
+pub const Dtype = dequant.types.Dtype;
 
 pub const ScaleRange = struct {
     min: u32,
     max: u32,
 };
 
-pub const SCALE_RANGE = std.EnumArray(Dtype, ScaleRange).initDefault(.{ .min = 0, .max = 0 }, .{ // scale codes drawn per scale dtype
-    .f8e4m3 = .{ .min = 0x01,   .max = 0x7E },   // e4m3 codes, 0x00 0x7F sign excluded
-    .f8e8m0 = .{ .min = 0x02,   .max = 0xFC },   // e8m0 codes, 0.5 * 2^(e-127) >= 2^-126, 6 * 2^(e-127) < 2^128 -> normal f32 only
-    .bf16   = .{ .min = 0x3C00, .max = 0x4200 }, // bf16 codes, 2^-7 .. 32
+pub const SCALE_RANGE = std.EnumArray(Dtype, ScaleRange).initDefault(.{ .min = 0, .max = 0 }, .{ // scale values drawn per scale dtype
+    .f8e4m3 = .{ .min = 0x01,   .max = 0x7E },   // e4m3, 0x00 0x7F sign excluded
+    .f8e8m0 = .{ .min = 0x02,   .max = 0xFC },   // e8m0, 0.5 * 2^(e-127) >= 2^-126, 6 * 2^(e-127) < 2^128 -> normal f32 only
+    .bf16   = .{ .min = 0x3C00, .max = 0x4200 }, // bf16, 2^-7 .. 32
 });
 
 pub const TRIAL_COUNT: u32 = 3;

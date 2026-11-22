@@ -5,10 +5,10 @@ const generic = @import("generic.zig");
 
 const ALIGN: std.mem.Alignment = .fromByteUnits(generic.CACHE_LINE_SIZE);
 
-fn DequantKernel(comptime scheme: generic.Scheme, comptime output_t: generic.Dtype) type {
+fn DequantKernel(comptime scheme: generic.Scheme, comptime out_scheme: generic.Scheme) type {
     return struct {
         pub const SCHEME: generic.Scheme = scheme;
-        pub const OUTPUT: generic.Dtype = output_t;
+        pub const OUTPUT: generic.Scheme = out_scheme;
 
         input: dequant.Input,
 
@@ -27,8 +27,8 @@ fn DequantKernel(comptime scheme: generic.Scheme, comptime output_t: generic.Dty
             };
         }
 
-        pub noinline fn Run(kernel: *const @This(), out: []u8) void {
-            dequant.dequant(scheme, output_t, kernel.input, out);
+        pub noinline fn Run(kernel: *const @This(), out: []u8, out_s: []u8) void {
+            dequant.dequant(scheme, out_scheme, kernel.input, out, out_s);
         }
     };
 }
@@ -36,8 +36,8 @@ fn DequantKernel(comptime scheme: generic.Scheme, comptime output_t: generic.Dty
 pub fn main(init: std.process.Init) !void {
     const args = harness.parseArgs(init.minimal.args.iterate());
     switch (args.scheme) {
-        inline else => |c_scheme| switch (args.output_t) {
-            inline else => |c_output_t| try harness.run(DequantKernel(c_scheme, c_output_t), "dequant  ", args.size_filter),
+        inline else => |c_scheme| switch (args.out_scheme) {
+            inline else => |c_out_scheme| try harness.run(DequantKernel(c_scheme, c_out_scheme), "dequant  ", args.size_filter),
         },
     }
 }

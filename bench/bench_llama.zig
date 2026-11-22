@@ -22,7 +22,7 @@ extern fn dequantize_row_mxfp4(blocks: [*]const BlockMxfp4, out: [*]f32, weight_
 
 const LlamaNvfp4Kernel = struct {
     pub const SCHEME: generic.Scheme = .nvfp4;
-    pub const OUTPUT: generic.Dtype = .f32;
+    pub const OUTPUT: generic.Scheme = .f32;
 
     blocks: []const BlockNvfp4,
 
@@ -40,7 +40,8 @@ const LlamaNvfp4Kernel = struct {
         return .{ .blocks = blocks };
     }
 
-    pub noinline fn Run(kernel: *const LlamaNvfp4Kernel, out: []u8) void {
+    pub noinline fn Run(kernel: *const LlamaNvfp4Kernel, out: []u8, out_s: []u8) void {
+        _ = out_s;
         const out_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, out));
         dequantize_row_nvfp4(kernel.blocks.ptr, out_f32.ptr, @intCast(out_f32.len));
     }
@@ -48,7 +49,7 @@ const LlamaNvfp4Kernel = struct {
 
 const LlamaMxfp4Kernel = struct {
     pub const SCHEME: generic.Scheme = .mxfp4;
-    pub const OUTPUT: generic.Dtype = .f32;
+    pub const OUTPUT: generic.Scheme = .f32;
 
     blocks: []const BlockMxfp4,
 
@@ -66,7 +67,8 @@ const LlamaMxfp4Kernel = struct {
         return .{ .blocks = blocks };
     }
 
-    pub noinline fn Run(kernel: *const LlamaMxfp4Kernel, out: []u8) void {
+    pub noinline fn Run(kernel: *const LlamaMxfp4Kernel, out: []u8, out_s: []u8) void {
+        _ = out_s;
         const out_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, out));
         dequantize_row_mxfp4(kernel.blocks.ptr, out_f32.ptr, @intCast(out_f32.len));
     }
@@ -74,7 +76,7 @@ const LlamaMxfp4Kernel = struct {
 
 pub fn main(init: std.process.Init) !void {
     const args = harness.parseArgs(init.minimal.args.iterate());
-    switch (args.output_t) {
+    switch (args.out_scheme) {
         .f32 => {},
         else => @panic("Args: llama.cpp output is f32 only"),
     }

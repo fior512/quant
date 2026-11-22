@@ -82,14 +82,14 @@ pub inline fn decode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
         
         const idx = wide & @as(Lanes, @splat(reg_units - 1));
 
-        const LO: @Vector(reg_units, f32) = TABLE[0..reg_units].*;
-        const HI: @Vector(reg_units, f32) = TABLE[t_size - reg_units..].*;
+        const TABLE_LO: @Vector(reg_units, f32) = TABLE[0..reg_units].*;
+        const TABLE_HI: @Vector(reg_units, f32) = TABLE[t_size - reg_units..].*;
 
         var lo: Floats = undefined;
         var hi: Floats = undefined;
         inline for (0..count) |lane_idx| {
-            lo[lane_idx] = LO[idx[lane_idx]];
-            hi[lane_idx] = HI[idx[lane_idx]];
+            lo[lane_idx] = TABLE_LO[idx[lane_idx]];
+            hi[lane_idx] = TABLE_HI[idx[lane_idx]];
         }
         return @select(f32, wide >= @as(Lanes, @splat(reg_units)), hi, lo);
     };
@@ -100,23 +100,23 @@ pub inline fn decode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
             const sign = (wide >> @splat(out_t.bits-1)) << @splat(31);
             const abs = wide & @as(Lanes, @splat((1 << (out_t.bits - 1)) - 1));
             const shifted: Floats = @bitCast(abs << @splat(23 - out_t.mant_bits));
-            const bias: f32 = @bitCast(@as(u32, 254 - @as(u32, out_t.bias)) << 23);
-            const magnitude: Lanes = @bitCast(shifted * @as(Floats, @splat(bias)));
+            const rescaled: f32 = @bitCast(@as(u32, 254 - @as(u32, out_t.bias)) << 23);
+            const magnitude: Lanes = @bitCast(shifted * @as(Floats, @splat(rescaled)));
             return @bitCast(sign | magnitude);
         },
         .exponent => {
             const zero: Lanes = @splat(0);
 
             const lo = @select(u32, wide == zero, @as(Lanes, @splat(0x00400000)), wide << @splat(23));
-            const bits = @select(u32, wide == @as(Lanes, @splat(0xFF)), @as(Lanes, @splat(0x7FC00000)), lo);
-            return @bitCast(bits);
+            const width_bits = @select(u32, wide == @as(Lanes, @splat(0xFF)), @as(Lanes, @splat(0x7FC00000)), lo);
+            return @bitCast(width_bits);
         },
         .native => {
             const Float = std.meta.Float(out_t.bits);
             const Int = @Int(.unsigned, out_t.bits);
             return @floatCast(@as(@Vector(count, Float), @bitCast(@as(@Vector(count, Int), @truncate(wide)))));
         },
-        .integer => return @as(Floats, @floatFromInt(wide)) - @as(Floats, @splat(@floatFromInt(out_t.bias))), // x - bias
+        .integer => return @as(Floats, @floatFromInt(wide)) - @as(Floats, @splat(@floatFromInt(out_t.bias))), // x - rescaled
     }
 }
 
@@ -132,8 +132,8 @@ pub inline fn encode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
         },
         .float => {
             const SHIFT = 23 - out_t.mant_bits; // f32 mantissa
-            const bits: Lanes = @bitCast(values);
-            const sign = (bits >> @splat(31)) << @splat(out_t.bits - 1);
+            const width_bits: Lanes = @bitCast(values);
+            const sign = (width_bits >> @splat(31)) << @splat(out_t.bits - 1);
             var abs_f = @abs(values);
             if (comptime out_t.expmode != .ieee) abs_f = @min(abs_f, @as(Floats, @splat(out_t.max))); // overflow
             const abs: Lanes = @bitCast(abs_f);
@@ -148,14 +148,14 @@ pub inline fn encode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
             const subnormal = @as(Lanes, @bitCast(abs_f + @as(Floats, @splat(MAGIC)))) -% @as(Lanes, @splat(@as(u32, @bitCast(MAGIC))));
             
             // ENCODE
-            const MIN_NORMAL: f32 = @bitCast(@as(u32, 128 - @as(u32, out_t.bias)) << 23); // 2^(1 - bias)
+            const MIN_NORMAL: f32 = @bitCast(@as(u32, 128 - @as(u32, out_t.bias)) << 23); // 2^(1 - rescaled)
             var code = @select(u32, abs_f < @as(Floats, @splat(MIN_NORMAL)), subnormal, normal);
             if (comptime out_t.expmode == .ieee) code = @min(code, @as(Lanes, @splat(((1 << out_t.exp_bits) - 1) << out_t.mant_bits))); // overflow
             return sign | code;
         },
         .exponent => return (@as(Lanes, @bitCast(values)) >> @splat(23)) & @as(Lanes, @splat(0xFF)), // floor(log2)
         .integer => {
-            const shifted = @round(values) + @as(Floats, @splat(@floatFromInt(out_t.bias))); // x + bias
+            const shifted = @round(values) + @as(Floats, @splat(@floatFromInt(out_t.bias))); // x + rescaled
             const clamped = @min(@max(shifted, @as(Floats, @splat(0))), @as(Floats, @splat((1 << out_t.bits) - 1)));
             return @intFromFloat(clamped);
         },

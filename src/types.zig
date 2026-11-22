@@ -152,6 +152,10 @@ pub const Scheme = enum {
         const scale_t = RECIPE.get(scheme).scale orelse return 0;
         return Dtype.RECIPE.get(scale_t).bits / 8;
     }
+
+    pub fn ScalesBytes(scheme: Scheme, weight_count: usize) usize {
+        return weight_count / RECIPE.get(scheme).block * ScaleSize(scheme);
+    }
 };
 
 

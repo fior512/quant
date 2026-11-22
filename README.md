@@ -63,7 +63,7 @@ The quantization pipeline is modular through `types.Dtype.RECIPE` and `types.Sch
 zig build test
 ```
 
-- `dequant: nvfp4`, `dequant: mxfp4`: all 16 E2M1 codes x 2 scales, bit-exact for f32 / f16 / bf16 (`-0.0` included)
+- `dequant: nvfp4`, `dequant: mxfp4`: all 16 E2M1 x 2 scales, bit-exact for f32 / f16 / bf16 (`-0.0` included)
 - `safetensors: parseJson`: scale and global scale merged into the weight layer.
 
 ## Benchmarks
@@ -112,6 +112,32 @@ xychart-beta
 - purple: f8e4m3
 - brown: i4
 - pink: f4e2m1
+
+### In and Out type permutations
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2a78d6, #FF9900, #2ca02c, #d62728, #9467bd, #8c564b, #e377c2"}}}}%%
+xychart-beta
+    title "L1 median ns/w, in_t (line) -> out_t (x)"
+    x-axis "out_scheme" ["nvfp4", "mxfp4", "i4", "f8e4m3", "f16", "bf16", "f32"]
+    y-axis "ns/w" 0 --> 1.44
+    line [0.9621, 0.6061, 0.3446, 0.1553, 0.0633, 0.1497, 0.0486]
+    line [0.8133, 0.6009, 0.4055, 0.1532, 0.0608, 0.1479, 0.0440]
+    line [0.8743, 0.5719, 0.3444, 0.1472, 0.0595, 0.1386, 0.0464]
+    line [1.2232, 0.9091, 0.4189, 0.2575, 0.1338, 0.2582, 0.1016]
+    line [0.8364, 0.5389, 0.3163, 0.1234, 0.0479, 0.1158, 0.0294]
+    line [1.2516, 1.1277, 0.4713, 0.1844, 0.1022, 0.1767, 0.0728]
+    line [1.1659, 1.0249, 0.3958, 0.1262, 0.0445, 0.1140, 0.0349]
+```
+
+- blue: nvfp4
+- orange: mxfp4
+- green: i4
+- red: f8e4m3
+- purple: f16
+- brown: bf16
+- pink: f32
+
 
 
 **Scaling:**
