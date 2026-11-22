@@ -57,14 +57,14 @@ done
 weights_count=$((blocks_bytes * 2))
 
 echo "# $model_name, min of 3 whole-model runs"
-echo "| out_t | 1t | 6t | 12t | GB/s in (6t) | GB/s out (6t) | qw/s (6t) |"
+echo "| out_scheme | 1t | 6t | 12t | GB/s in (6t) | GB/s out (6t) | qw/s (6t) |"
 echo "|---|---|---|---|---|---|---|"
-for type in f32 f16 bf16 f8e4m3 f8e8m0 i4 f4e2m1; do
+for type in nvfp4 mxfp4 i4 f8e4m3 f16 bf16 f32; do
   case "$type" in
     f32)                out_bits=32 ;;
     f16 | bf16)         out_bits=16 ;;
-    f8e4m3 | f8e8m0)    out_bits=8 ;;
-    i4 | f4e2m1)        out_bits=4 ;;
+    f8e4m3)             out_bits=8 ;;
+    nvfp4 | mxfp4 | i4) out_bits=4 ;;
   esac
   t1=$(measure_total_ms "$type" 1)
   t6=$(measure_total_ms "$type" 6)
@@ -77,9 +77,9 @@ for type in f32 f16 bf16 f8e4m3 f8e8m0 i4 f4e2m1; do
 done
 
 echo ""
-echo "# xychart: $model_name, GB/s in vs threads, one line per out_t"
+echo "# xychart: $model_name, GB/s in vs threads, one line per out_scheme"
 echo "threads: 1 2 3 4 6 8 12"
-for type in f4e2m1 i4 f8e4m3 f8e8m0 f16 bf16 f32; do
+for type in nvfp4 mxfp4 i4 f8e4m3 f16 bf16 f32; do
   in_line=""
   for t in 1 2 3 4 6 8 12; do
     ms=$(measure_total_ms "$type" "$t")

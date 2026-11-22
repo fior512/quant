@@ -8,7 +8,7 @@ const CACHE_LINE = std.atomic.cache_line;
 const CHUNK_SIZE = 0x40000; // 256KiB, max layer slice
 const SCALES_SIZE = CHUNK_SIZE / 8; // smallest scale block: nvfp4 16 elements -> 8 B -> 1 scale
 
-const max_weights_per_byte = blk: {
+const MAX_WEIGHTS_PER_BYTE = blk: {
     var max_count: usize = 0;
     for (std.enums.values(types.Scheme)) |scheme| {
         const weight_t = types.Scheme.RECIPE.get(scheme).weight;
@@ -17,26 +17,27 @@ const max_weights_per_byte = blk: {
     break :blk max_count;
 };
 
-const max_out_value_size = blk: {
+const MAX_OUT_VALUE_SIZE = blk: {
     var max_size: usize = 0;
     for (std.enums.values(types.Dtype)) |dtype| {
         const recipe = types.Dtype.RECIPE.get(dtype);
-        max_size = @max(max_size, recipe.bits/8);
+        max_size = @max(max_size, recipe.bits / 8);
     }
     break :blk max_size;
 };
-const OUT_SIZE = CHUNK_SIZE * max_weights_per_byte * max_out_value_size;
+const OUT_SIZE = CHUNK_SIZE * MAX_WEIGHTS_PER_BYTE * MAX_OUT_VALUE_SIZE;
 
-fn worker(shared: *Shared) !void {
-    var weight_buf: [CHUNK_SIZE]u8 align(CACHE_LINE) = undefined;
-    var scales_buf: [SCALES_SIZE]u8 align(CACHE_LINE) = undefined;
-    var out_buf: [OUT_SIZE]u8 align(CACHE_LINE) = undefined;
+fn worker(shared: *Shared) !void { //TODO rewrite
+    var in_w_buf: [CHUNK_SIZE]u8 align(CACHE_LINE) = undefined;
+    var in_s_buf: [SCALES_SIZE]u8 align(CACHE_LINE) = undefined;
+    var out_w_buf: [OUT_SIZE]u8 align(CACHE_LINE) = undefined;
+    var out_s_buf: [SCALES_SIZE]u8 align(CACHE_LINE) = undefined;
 
-    var weight_reader = shared.in.reader(shared.io, &weight_buf);
-    var scales_reader = shared.in.reader(shared.io, &scales_buf);
+    var weight_reader = shared.in.reader(shared.io, &in_w_buf);
+    var scales_reader = shared.in.reader(shared.io, &in_s_buf);
     const out_bits: usize = types.Dtype.RECIPE.get(
-        shared.out_t,
-    ).bits; // TODO: better name, this is single weight bits size
+        types.Scheme.RECIPE.get(shared.out_scheme).weight,
+    ).bits; // single weight bits size
 
     while (true) {
         const layer_idx = shared.next.fetchAdd(1, .monotonic);
@@ -48,17 +49,16 @@ fn worker(shared: *Shared) !void {
 
         var rem_size = layer.weight_size;
         while (rem_size > 0) {
-            const weight_size: usize = @intCast(@min(CHUNK_SIZE, rem_size));
-            rem_size -= weight_size;
-            const weights = try weight_reader.interface.take(weight_size);
+            const chunk_size: usize = @intCast(@min(CHUNK_SIZE, rem_size)); //TODO: name
+            rem_size -= chunk_size;
+            const weights = try weight_reader.interface.take(chunk_size);
 
             // FAST PATH (skip unknown)
-            const scheme = layer.scheme orelse { //TODO: rearrange
+            const scheme = layer.scheme orelse { // null
                 std.mem.doNotOptimizeAway(weights); // endpoint
                 continue;
             };
-            const recipe = types.Scheme.RECIPE.get(scheme);
-            if (recipe.scale == null and recipe.weight == shared.out_t and layer.global_scale == 1.0) {
+            if (scheme == shared.out_scheme) { // done
                 std.mem.doNotOptimizeAway(weights); //endpoint
                 continue;
             }
@@ -67,30 +67,29 @@ fn worker(shared: *Shared) !void {
             const weight_bits: usize = types.Dtype.RECIPE.get(
                 types.Scheme.RECIPE.get(scheme).weight,
             ).bits;
+            const weight_count = chunk_size * 8 / weight_bits; // weights, scheme-independent
             const scales = try scales_reader.interface.take(
-                weight_size / scheme.BlockSize() * scheme.ScaleSize(),
+                types.Scheme.ScalesBytes(scheme, weight_count),
             );
-            const out = out_buf[0 .. weight_size * 8 // bytes -> bits
-                / weight_bits // how many weights
-                * out_bits // output bits
-                / 8 // bytes
-            ];
+            const out_w = out_w_buf[0 .. weight_count * out_bits / 8]; // bytes
+            const out_s = out_s_buf[0..types.Scheme.ScalesBytes(shared.out_scheme, weight_count)];
 
-            dequant.dequant(scheme, shared.out_t, .{
+            dequant.dequant(scheme, shared.out_scheme, .{
                 .weights = weights,
                 .scales = scales,
                 .midpoint = &.{},
                 .global_scale = layer.global_scale,
-            }, out);
+            }, out_w, out_s);
 
-            std.mem.doNotOptimizeAway(out); //endpoint
+            std.mem.doNotOptimizeAway(out_w); //endpoint
+            std.mem.doNotOptimizeAway(out_s); //endpoint
         }
     }
 }
 
 const Args = struct {
     path: []const []const u8,
-    out_t: types.Dtype,
+    out_scheme: types.Scheme,
     threads: usize,
 };
 
@@ -103,15 +102,15 @@ inline fn flags(gpa: std.mem.Allocator, args: std.process.Args.Iterator) !Args {
 
     while (it.next()) |arg| try rest.append(gpa, arg);
     if (rest.items.len < 3) @panic(
-        "Args: missing argument (binary {.safetensors} {out_t} {threads})",
+        "Args: missing argument (binary {.safetensors} {out_scheme} {threads})",
     ); // missing
 
     //.SAFETENSORS
     const path = try gpa.dupe([]const u8, rest.items[0 .. rest.items.len - 2]);
 
     //DEQUANT TYPE
-    const out_t =
-        std.meta.stringToEnum(types.Dtype, rest.items[rest.items.len - 2]) orelse
+    const out_scheme =
+        std.meta.stringToEnum(types.Scheme, rest.items[rest.items.len - 2]) orelse
         @panic("Args: Unknown output type");
 
     //THREADPOOL
@@ -123,7 +122,7 @@ inline fn flags(gpa: std.mem.Allocator, args: std.process.Args.Iterator) !Args {
 
     return Args{
         .path = path,
-        .out_t = out_t,
+        .out_scheme = out_scheme,
         .threads = threads,
     };
 }
@@ -133,7 +132,7 @@ const Shared = struct {
     io: std.Io,
     layers: []const safetensors.Layer,
     in: std.Io.File,
-    out_t: types.Dtype,
+    out_scheme: types.Scheme,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -147,9 +146,9 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(args.path);
     defer init.gpa.free(threads);
 
-    for (args.path) |file| {
+    for (args.path) |path| {
         //FILE
-        const in = try std.Io.Dir.cwd().openFile(init.io, file, .{});
+        const in = try std.Io.Dir.cwd().openFile(init.io, path, .{});
         defer in.close(init.io);
 
         //HEADER MAPING
@@ -164,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
             .io = init.io,
             .layers = layers,
             .in = in,
-            .out_t = args.out_t,
+            .out_scheme = args.out_scheme,
         };
         for (threads) |*thread| thread.* = try std.Thread.spawn(.{}, worker, .{&shared});
         for (threads) |thread| thread.join();
@@ -175,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
 // TESTS
 
 // DEQUANT
+//
 test "dequant: nvfp4" {
     const weights: [16]u8 = @bitCast(
         @as([2][8]u8, @splat(.{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE })),
@@ -193,21 +193,21 @@ test "dequant: nvfp4" {
     };
 
     var out_f32: [32]f32 = undefined;
-    dequant.dequant(.nvfp4, .f32, in, @ptrCast(&out_f32));
+    dequant.dequant(.nvfp4, .f32, in, @ptrCast(&out_f32), &.{});
     for (want, out_f32) |w, got| try std.testing.expectEqual(
         @as(u32, @bitCast(w)),
         @as(u32, @bitCast(got)),
     ); // bits: -0.0 != 0.0
 
     var out_f16: [32]f16 = undefined;
-    dequant.dequant(.nvfp4, .f16, in, @ptrCast(&out_f16));
+    dequant.dequant(.nvfp4, .f16, in, @ptrCast(&out_f16), &.{});
     for (want, out_f16) |w, got| try std.testing.expectEqual(
         @as(u16, @bitCast(@as(f16, @floatCast(w)))),
         @as(u16, @bitCast(got)),
     );
 
     var out_bf16: [32]u16 = undefined;
-    dequant.dequant(.nvfp4, .bf16, in, @ptrCast(&out_bf16));
+    dequant.dequant(.nvfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
     for (want, out_bf16) |w, got| try std.testing.expectEqual(
         @as(u16, @truncate(@as(u32, @bitCast(w)) >> 16)),
         got,
@@ -231,21 +231,21 @@ test "dequant: mxfp4" {
     const want = x2 ++ x2 ++ x1 ++ x1;
 
     var out_f32: [64]f32 = undefined;
-    dequant.dequant(.mxfp4, .f32, in, @ptrCast(&out_f32));
+    dequant.dequant(.mxfp4, .f32, in, @ptrCast(&out_f32), &.{});
     for (want, out_f32) |w, got| try std.testing.expectEqual(
         @as(u32, @bitCast(w)),
         @as(u32, @bitCast(got)),
     );
 
     var out_f16: [64]f16 = undefined;
-    dequant.dequant(.mxfp4, .f16, in, @ptrCast(&out_f16));
+    dequant.dequant(.mxfp4, .f16, in, @ptrCast(&out_f16), &.{});
     for (want, out_f16) |w, got| try std.testing.expectEqual(
         @as(u16, @bitCast(@as(f16, @floatCast(w)))),
         @as(u16, @bitCast(got)),
     );
 
     var out_bf16: [64]u16 = undefined;
-    dequant.dequant(.mxfp4, .bf16, in, @ptrCast(&out_bf16));
+    dequant.dequant(.mxfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
     for (want, out_bf16) |w, got| try std.testing.expectEqual(
         @as(u16, @truncate(@as(u32, @bitCast(w)) >> 16)),
         got,
@@ -270,13 +270,13 @@ test "safetensors: parseJson" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "model.safetensors", .{ .read = true });
-    defer file.close(io);
-    try file.writePositionalAll(io, &size ++ json ++ &data, 0);
+    const path = try tmp.dir.createFile(io, "model.safetensors", .{ .read = true });
+    defer path.close(io);
+    try path.writePositionalAll(io, &size ++ json ++ &data, 0);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const layers = try safetensors.parseJson(file, io, arena.allocator());
+    const layers = try safetensors.parseJson(path, io, arena.allocator());
     const start = 8 + json.len;
 
     try std.testing.expectEqual(
