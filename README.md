@@ -84,7 +84,7 @@ hf download openai/gpt-oss-20b --include "model-*.safetensors" --local-dir model
 ./bench/target.sh
 ```
 
-| target | ISA | gpt f32 | gpt f16 | gpt bf16 | kernel nvfp4 → f32 ns/w | cyc/block (mca) |
+| target | ISA | gpt f32 | gpt f16 | gpt bf16 | kernel nvfp4 to f32 ns/w | cyc/block (mca) |
 |---|---|---|---|---|---|---|
 | x86_64_v1 | SSE2 | 6380 ms | 101190 ms | 15740 ms | 0.3892 | 10.0 |
 | x86_64_v2 | SSE4.2 | 6470 ms | 101240 ms | 13520 ms | 0.3882 | 9.7 |
