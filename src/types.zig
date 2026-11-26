@@ -63,7 +63,7 @@ pub const Dtype = enum {
         none,       // finite; overflow max
     };
 
-    pub const Recipe = struct { //TODO rename
+    pub const Recipe = struct {
         header: ?[]const u8, // "dtype" given as str in header
         max: f32,
         bits: u8,
@@ -143,9 +143,23 @@ pub const Scheme = enum {
         return null;
     }
 
+    pub fn Block(scheme: Scheme) usize {
+        return RECIPE.get(scheme).block;
+    }
+
+    pub fn WeightsSize(scheme: Scheme, weight_count: usize) usize {
+        const bits = Dtype.RECIPE.get(RECIPE.get(scheme).weight).bits;
+        std.debug.assert(weight_count * bits % 8 == 0);
+        return weight_count * bits / 8;
+    }
+
+    pub fn ScalesPerBlock(scheme: Scheme, weight_count: usize) usize {
+        std.debug.assert(weight_count % scheme.Block() == 0);
+        return weight_count / scheme.Block();
+    }
+
     pub fn BlockSize(scheme: Scheme) usize {
-        const recipe = RECIPE.get(scheme);
-        return recipe.block * Dtype.RECIPE.get(recipe.weight).bits / 8;
+        return scheme.WeightsSize(scheme.Block());
     }
 
     pub fn ScaleSize(scheme: Scheme) usize {

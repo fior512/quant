@@ -1,23 +1,25 @@
 
-Dequantizer for `.safetensors` in Zig (0.17)
+Quantization and dequantization for `.safetensors` in Zig (0.17)
 
 gpt-oss-20b (`openai/gpt-oss-20b`, 12.8 GiB, MXFP4 experts) on Ryzen 5 7600X:
 
-| out_t | 1t | 6t | 12t | GB/s in (6t) | GB/s out (6t) | qw/s (6t) |
-|---|---|---|---|---|---|---|
-| f32 | 1510 ms | 360 ms | 380 ms | 38.2 | 212.3 | 53.1 G |
-| f16 | 1840 ms | 420 ms | 380 ms | 32.8 | 91.0 | 45.5 G |
-| bf16 | 3400 ms | 700 ms | 630 ms | 19.7 | 54.6 | 27.3 G |
-| f8e4m3 | 3770 ms | 800 ms | 700 ms | 17.2 | 23.9 | 23.9 G |
-| f8e8m0 | 1770 ms | 410 ms | 360 ms | 33.6 | 46.6 | 46.6 G |
-| i4 | 3390 ms | 720 ms | 640 ms | 19.1 | 13.3 | 26.5 G |
-| f4e2m1 | 4210 ms | 890 ms | 790 ms | 15.5 | 10.7 | 21.5 G |
+| out_scheme | 1t | 6t | 12t | file GB/s (6t) |
+|---|---|---|---|---|
+| nvfp4 | 6920 ms | 1450 ms | 1190 ms | 9.5 |
+| mxfp4 | 960 ms | 370 ms | 360 ms | 37.2 |
+| i4 | 4350 ms | 910 ms | 780 ms | 15.1 |
+| f8e4m3 | 3830 ms | 810 ms | 710 ms | 17.0 |
+| f16 | 1820 ms | 420 ms | 380 ms | 32.8 |
+| bf16 | 3450 ms | 710 ms | 640 ms | 19.4 |
+| f32 | 1480 ms | 360 ms | 400 ms | 38.2 |
+
+File GB/s divides total shard size by wall time. For `mxfp4` output, MXFP4 experts pass through and BF16 tensors are quantized.
 
 ## Usage
 
 ```sh
 zig build -Doptimize=ReleaseFast -Dcpu=native
-./zig-out/bin/dequant ./models/gpt-oss-20b/model*.safetensors f32 8
+./zig-out/bin/quant ./models/gpt-oss-20b/model*.safetensors f32 8
 ```
 
 Recognized tensor layouts (`src/safetensors.zig`, `HEADERS`):
@@ -45,14 +47,15 @@ main
 
 worker
   incremental atomic counter as shared chunk idx
-  read -> dequant -> `doNotOptimizeAway()`
+  out -> `doNotOptimizeAway()`
 
-dequant block
+quant block
   unpack                            lo/hi shuffle
-  decode     e_m_ -> f32
-  loadScale  e_m_ -> f32            lookup translate
+  decode     in_t -> f32
+  scaleIn    in_t -> f32            lookup translate
   translate  f32                    RTN | std-affine         
-  encode     f32 -> out_t           f32 | f16 | bf16
+  scaleOut   f32 -> out scales      scaled output only
+  encode     f32 -> out_t
   pack                              lo/hi shuffle
 ```
 The quantization pipeline is modular through `types.Dtype.RECIPE` and `types.Scheme.RECIPE` which holds type recipies. All threads reuse their buffer, kept via `doNotOptimizeAway`.
@@ -63,12 +66,12 @@ The quantization pipeline is modular through `types.Dtype.RECIPE` and `types.Sch
 zig build test
 ```
 
-- `dequant: nvfp4`, `dequant: mxfp4`: all 16 E2M1 x 2 scales, bit-exact for f32 / f16 / bf16 (`-0.0` included)
+- `quant: nvfp4`, `quant: mxfp4`: all 16 E2M1 x 2 scales, bit-exact for f32 / f16 / bf16 (`-0.0` included)
 - `safetensors: parseJson`: scale and global scale merged into the weight layer.
 
 ## Benchmarks
 
-Setup: Ryzen 5 7600X (Zen 4, 6C/12T), DDR5, Linux 6.18, boost on, EPP balance_performance, zig 0.17. Files warm in page cache. Min of 3 per shard, summed over shards.
+Setup: Ryzen 5 7600X (Zen 4, 6C/12T), DDR5, Linux 6.18, boost on, EPP balance_performance, zig 0.17. Files warm in page cache. Minimum of three runs across all shards.
 
 ```sh
 hf download openai/gpt-oss-20b --include "model-*.safetensors" --local-dir models/gpt-oss-20b
@@ -81,53 +84,57 @@ hf download openai/gpt-oss-20b --include "model-*.safetensors" --local-dir model
 ./bench/target.sh
 ```
 
-| target | ISA | gpt f32 | gpt f16 | gpt bf16 | kernel nvfp4 ns/w | cyc/block (mca) |
+| target | ISA | gpt f32 | gpt f16 | gpt bf16 | kernel nvfp4 → f32 ns/w | cyc/block (mca) |
 |---|---|---|---|---|---|---|
-| x86_64_v1 | SSE2 | 5430 ms | 88330 ms | 7040 ms | 0.2827 | 25.0 |
-| x86_64_v2 | SSE4.2 | 5450 ms | 88270 ms | 7040 ms | 0.2909 | 25.0 |
-| x86_64_v3 | AVX2+F16C | 2010 ms | 2580 ms | 3340 ms | 0.0785 | 15.0 |
-| x86_64_v4 | AVX-512 | 1710 ms | 1930 ms | 2720 ms | 0.0663 | 5.0 |
-| native | znver4+GFNI | 1320 ms | 1640 ms | 2330 ms | 0.0439 | 3.0 |
+| x86_64_v1 | SSE2 | 6380 ms | 101190 ms | 15740 ms | 0.3892 | 10.0 |
+| x86_64_v2 | SSE4.2 | 6470 ms | 101240 ms | 13520 ms | 0.3882 | 9.7 |
+| x86_64_v3 | AVX2+F16C | 2180 ms | 2680 ms | 5290 ms | 0.0815 | 5.3 |
+| x86_64_v4 | AVX-512 | 1880 ms | 2090 ms | 3880 ms | 0.0681 | 4.0 |
+| native | znver4 | 1480 ms | 1820 ms | 3470 ms | 0.0473 | 3.0 |
+
+Model times are the minimum of up to three runs with a 10 s budget per permutation. Kernel times are medians of three 10 s trials. `cyc/block` is `llvm-mca` block reciprocal throughput on `znver4`, for the executed 16-weight inner loop.
 
 ### Thread scaling
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2a78d6, #FF9900, #2ca02c, #d62728, #9467bd, #8c564b, #e377c2"}}}}%%
 xychart-beta
-    title "gpt-oss-20b, GB/s in vs threads"
+    title "gpt-oss-20b, file GB/s vs threads"
     x-axis "threads" ["1", "2", "3", "4", "6", "8", "12"]
-    y-axis "GB/s in" 0 --> 45
-    line [9.1, 17.4, 24.1, 30.6, 38.2, 39.3, 36.2]
-    line [7.5, 14.5, 20.2, 26.0, 32.8, 33.6, 35.3]
-    line [4.0, 7.7, 11.1, 14.8, 19.7, 20.5, 22.2]
-    line [7.8, 15.0, 21.2, 27.0, 33.6, 36.2, 37.2]
-    line [3.7, 7.1, 10.2, 13.5, 17.2, 18.6, 19.9]
-    line [4.1, 7.9, 11.4, 15.0, 19.1, 19.7, 21.5]
-    line [3.3, 6.3, 9.2, 12.1, 15.6, 16.4, 17.4]
+    y-axis "file GB/s" 0 --> 45
+    line [8.1, 15.5, 21.8, 28.1, 34.4, 34.4, 34.4]
+    line [7.6, 14.6, 20.5, 25.5, 32.0, 34.4, 37.2]
+    line [4.4, 8.6, 12.2, 15.6, 21.5, 23.3, 24.6]
+    line [4.1, 7.9, 11.4, 14.6, 19.1, 20.2, 21.8]
+    line [2.4, 4.6, 5.7, 8.3, 11.4, 12.5, 13.8]
+    line [1.1, 2.1, 3.1, 3.8, 5.3, 5.8, 6.2]
+    line [12.2, 23.3, 28.1, 29.9, 31.3, 32.0, 32.8]
 ```
 - blue: f32
 - orange: f16
 - green: bf16
-- red: f8e8m0
-- purple: f8e4m3
-- brown: i4
-- pink: f4e2m1
+- red: f8e4m3
+- purple: i4
+- brown: nvfp4
+- pink: mxfp4 (experts pass through)
 
 ### In and Out type permutations
+
+`./bench/matrix.sh L1` runs three 200 ms trials per conversion. `./bench/matrix.sh --full L1` uses three 10 s trials with 2 s gaps. Diagonal zeros mark skipped conversions.
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2a78d6, #FF9900, #2ca02c, #d62728, #9467bd, #8c564b, #e377c2"}}}}%%
 xychart-beta
-    title "L1 median ns/w, in_t (line) -> out_t (x)"
+    title "L1 median ns/w, in_scheme (line) -> out_scheme (x)"
     x-axis "out_scheme" ["nvfp4", "mxfp4", "i4", "f8e4m3", "f16", "bf16", "f32"]
-    y-axis "ns/w" 0 --> 1.44
-    line [0.9621, 0.6061, 0.3446, 0.1553, 0.0633, 0.1497, 0.0486]
-    line [0.8133, 0.6009, 0.4055, 0.1532, 0.0608, 0.1479, 0.0440]
-    line [0.8743, 0.5719, 0.3444, 0.1472, 0.0595, 0.1386, 0.0464]
-    line [1.2232, 0.9091, 0.4189, 0.2575, 0.1338, 0.2582, 0.1016]
-    line [0.8364, 0.5389, 0.3163, 0.1234, 0.0479, 0.1158, 0.0294]
-    line [1.2516, 1.1277, 0.4713, 0.1844, 0.1022, 0.1767, 0.0728]
-    line [1.1659, 1.0249, 0.3958, 0.1262, 0.0445, 0.1140, 0.0349]
+    y-axis "ns/w" 0 --> 0.75
+    line [0.3594, 0.2558, 0.1909, 0.1570, 0.0632, 0.1519, 0.0493]
+    line [0.2904, 0.2509, 0.2628, 0.1548, 0.0590, 0.1522, 0.0441]
+    line [0.2723, 0.2131, 0.1772, 0.1450, 0.0581, 0.1389, 0.0455]
+    line [0.3378, 0.3104, 0.2326, 0.2593, 0.1409, 0.2595, 0.1059]
+    line [0.2538, 0.2293, 0.1678, 0.1248, 0.0475, 0.1164, 0.0289]
+    line [0.4536, 0.4420, 0.2939, 0.1827, 0.0953, 0.1716, 0.0660]
+    line [0.3945, 0.4044, 0.2330, 0.1226, 0.0442, 0.1129, 0.0402]
 ```
 
 - blue: nvfp4
@@ -137,7 +144,6 @@ xychart-beta
 - purple: f16
 - brown: bf16
 - pink: f32
-
 
 
 **Scaling:**
@@ -150,22 +156,37 @@ Caveat: `out_buf` is reused, so output never reaches DRAM. A real f32 consumer w
 
 ### Kernel vs llama.cpp
 
-Output f32, 1 thread, kernels only (no file read, parse or orchestration). Median ns/weight.
+1 thread, kernels only (no file read, parse or orchestration). Median ns/weight.
+
+#### Dequantization to f32
 
 | size | cache | llama.cpp nvfp4 | HEAD nvfp4 | ratio | llama.cpp mxfp4 | HEAD mxfp4 | ratio |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 18 KiB | L1 | 0.2899 | 0.0436 | 6.65x | 0.2656 | 0.0439 | 6.05x |
-| 584 KiB | L2 | 0.2924 | 0.0445 | 6.57x | 0.2660 | 0.0446 | 5.96x |
-| 18 MiB | L3 | 0.3159 | 0.0455 | 6.94x | 0.2673 | 0.0459 | 5.82x |
-| 292 MiB | DRAM | 0.3171 | 0.1427 | 2.22x | 0.2680 | 0.1419 | 1.89x |
+| 18 KiB | L1 | 0.2902 | 0.0475 | 6.11x | 0.2677 | 0.0480 | 5.58x |
+| 584 KiB | L2 | 0.2936 | 0.0531 | 5.53x | 0.2685 | 0.0462 | 5.81x |
+| 18 MiB | L3 | 0.3162 | 0.0524 | 6.03x | 0.2673 | 0.0463 | 5.77x |
+| 292 MiB | DRAM | 0.3169 | 0.1452 | 2.18x | 0.2676 | 0.1428 | 1.87x |
+
+#### Quantization from f32
+
+| size | cache | llama.cpp nvfp4 | HEAD nvfp4 | ratio | llama.cpp mxfp4 | HEAD mxfp4 | ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 18 KiB | L1 | 0.8990 | 0.4144 | 2.17x | 1.4204 | 0.3940 | 3.61x |
+| 584 KiB | L2 | 0.9017 | 0.4079 | 2.21x | 1.4237 | 0.3949 | 3.61x |
+| 18 MiB | L3 | 0.9024 | 0.4068 | 2.22x | 1.4238 | 0.3981 | 3.58x |
+| 292 MiB | DRAM | 0.9028 | 0.4084 | 2.21x | 1.4231 | 0.3985 | 3.57x |
+
+Sizes use the nvfp4 input and output footprint. llama.cpp quantization uses reference kernels; its harness validates a roundtrip without comparing output bit-for-bit against `quant`.
 
 ```sh
 ./bench/build.sh
-./bench/out/bench_llama nvfp4 && ./bench/out/bench_dequant nvfp4
-./bench/out/bench_llama mxfp4 && ./bench/out/bench_dequant mxfp4
+./bench/out/bench_llama nvfp4 && ./bench/out/bench_quant nvfp4
+./bench/out/bench_llama mxfp4 && ./bench/out/bench_quant mxfp4
+./bench/out/bench_llama_quant nvfp4 && ./bench/out/bench_quant f32 nvfp4
+./bench/out/bench_llama_quant mxfp4 && ./bench/out/bench_quant f32 mxfp4
 ```
 
-> llama.cpp kernels from `tests/test-quantize-perf.cpp`, master `ded522f8304554317e7ff8f88698dbbbca5425aa` (2026-11-13). Pinned, 3 trials x 20 s, TSC-timed.
+> llama.cpp kernels from `tests/test-quantize-perf.cpp`, master `ded522f8304554317e7ff8f88698dbbbca5425aa` (2026-11-13). Pinned, 3 trials x 10 s, TSC-timed, with 2 s gaps for multiple sizes and 10 s gaps for a single size.
 
 ## TODO
 

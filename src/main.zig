@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const safetensors = @import("safetensors.zig");
-const dequant = @import("dequant.zig");
+const quant = @import("quant.zig");
 const kernels = @import("kernels.zig");
 
 const CACHE_LINE = std.atomic.cache_line;
@@ -44,8 +44,9 @@ fn worker(shared: *Shared) !void { //TODO rewrite
         if (layer_idx >= shared.layers.len) return; // done
 
         const layer = shared.layers[layer_idx];
+        const check_scheme = if (layer.scheme == shared.out_scheme) null else layer.scheme;
         try weight_reader.seekTo(layer.weight_offset);
-        try scales_reader.seekTo(layer.scale_offset);
+        if (check_scheme != null) try scales_reader.seekTo(layer.scale_offset);
 
         var rem_size = layer.weight_size;
         while (rem_size > 0) {
@@ -53,17 +54,12 @@ fn worker(shared: *Shared) !void { //TODO rewrite
             rem_size -= chunk_size;
             const weights = try weight_reader.interface.take(chunk_size);
 
-            // FAST PATH (skip unknown)
-            const scheme = layer.scheme orelse { // null
-                std.mem.doNotOptimizeAway(weights); // endpoint
+            const scheme = check_scheme orelse {
+                std.mem.doNotOptimizeAway(weights);
                 continue;
             };
-            if (scheme == shared.out_scheme) { // done
-                std.mem.doNotOptimizeAway(weights); //endpoint
-                continue;
-            }
 
-            // DEQUANT
+            // QUANTIZATION
             const weight_bits: usize = types.Dtype.RECIPE.get(
                 types.Scheme.RECIPE.get(scheme).weight,
             ).bits;
@@ -74,7 +70,7 @@ fn worker(shared: *Shared) !void { //TODO rewrite
             const out_w = out_w_buf[0 .. weight_count * out_bits / 8]; // bytes
             const out_s = out_s_buf[0..types.Scheme.ScalesBytes(shared.out_scheme, weight_count)];
 
-            dequant.dequant(scheme, shared.out_scheme, .{
+            quant.quant(scheme, shared.out_scheme, .{
                 .weights = weights,
                 .scales = scales,
                 .midpoint = &.{},
@@ -101,27 +97,22 @@ inline fn flags(gpa: std.mem.Allocator, args: std.process.Args.Iterator) !Args {
     defer rest.deinit(gpa);
 
     while (it.next()) |arg| try rest.append(gpa, arg);
-    if (rest.items.len < 3) @panic(
-        "Args: missing argument (binary {.safetensors} {out_scheme} {threads})",
-    ); // missing
+    if (rest.items.len < 3) return error.MissingArguments;
 
-    //.SAFETENSORS
-    const path = try gpa.dupe([]const u8, rest.items[0 .. rest.items.len - 2]);
-
-    //DEQUANT TYPE
+    // SCHEME
     const out_scheme =
         std.meta.stringToEnum(types.Scheme, rest.items[rest.items.len - 2]) orelse
-        @panic("Args: Unknown output type");
+        return error.UnknownOutputScheme;
 
-    //THREADPOOL
+    // THREADS
     const threads =
         std.fmt.parseInt(usize, rest.items[rest.items.len - 1], 10) catch
-            @panic("Args: Invalid thread count");
+            return error.InvalidThreadCount;
 
-    if (threads == 0 or threads > 12) @panic("Args: Invalid thread count");
+    if (threads == 0 or threads > 12) return error.InvalidThreadCount;
 
     return Args{
-        .path = path,
+        .path = try gpa.dupe([]const u8, rest.items[0 .. rest.items.len - 2]),
         .out_scheme = out_scheme,
         .threads = threads,
     };
@@ -142,8 +133,8 @@ pub fn main(init: std.process.Init) !void {
 
     // ARGS
     const args = try flags(init.gpa, init.minimal.args.iterate());
-    const threads: []std.Thread = try init.gpa.alloc(std.Thread, args.threads);
     defer init.gpa.free(args.path);
+    const threads: []std.Thread = try init.gpa.alloc(std.Thread, args.threads);
     defer init.gpa.free(threads);
 
     for (args.path) |path| {
@@ -173,14 +164,12 @@ pub fn main(init: std.process.Init) !void {
 // -------------------------------------------------------------------------------------
 // TESTS
 
-// DEQUANT
-//
-test "dequant: nvfp4" {
+test "quant: nvfp4" {
     const weights: [16]u8 = @bitCast(
         @as([2][8]u8, @splat(.{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE })),
     );
     const scales = [_]u8{ 0x38, 0x30 }; // e4m3: 1.0, 0.5
-    const in: dequant.Input = .{
+    const in: quant.Input = .{
         .weights = &weights,
         .scales = &scales,
         .midpoint = &.{},
@@ -193,33 +182,33 @@ test "dequant: nvfp4" {
     };
 
     var out_f32: [32]f32 = undefined;
-    dequant.dequant(.nvfp4, .f32, in, @ptrCast(&out_f32), &.{});
+    quant.quant(.nvfp4, .f32, in, @ptrCast(&out_f32), &.{});
     for (want, out_f32) |w, got| try std.testing.expectEqual(
         @as(u32, @bitCast(w)),
         @as(u32, @bitCast(got)),
     ); // bits: -0.0 != 0.0
 
     var out_f16: [32]f16 = undefined;
-    dequant.dequant(.nvfp4, .f16, in, @ptrCast(&out_f16), &.{});
+    quant.quant(.nvfp4, .f16, in, @ptrCast(&out_f16), &.{});
     for (want, out_f16) |w, got| try std.testing.expectEqual(
         @as(u16, @bitCast(@as(f16, @floatCast(w)))),
         @as(u16, @bitCast(got)),
     );
 
     var out_bf16: [32]u16 = undefined;
-    dequant.dequant(.nvfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
+    quant.quant(.nvfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
     for (want, out_bf16) |w, got| try std.testing.expectEqual(
         @as(u16, @truncate(@as(u32, @bitCast(w)) >> 16)),
         got,
     ); // exact values: bf16 == high u16
 }
 
-test "dequant: mxfp4" {
+test "quant: mxfp4" {
     const weights: [32]u8 = @bitCast(
         @as([4][8]u8, @splat(.{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE })),
     );
     const scales = [_]u8{ 0x80, 0x7F }; // e8m0: 2^1, 2^0
-    const in: dequant.Input = .{
+    const in: quant.Input = .{
         .weights = &weights,
         .scales = &scales,
         .midpoint = &.{},
@@ -231,21 +220,21 @@ test "dequant: mxfp4" {
     const want = x2 ++ x2 ++ x1 ++ x1;
 
     var out_f32: [64]f32 = undefined;
-    dequant.dequant(.mxfp4, .f32, in, @ptrCast(&out_f32), &.{});
+    quant.quant(.mxfp4, .f32, in, @ptrCast(&out_f32), &.{});
     for (want, out_f32) |w, got| try std.testing.expectEqual(
         @as(u32, @bitCast(w)),
         @as(u32, @bitCast(got)),
     );
 
     var out_f16: [64]f16 = undefined;
-    dequant.dequant(.mxfp4, .f16, in, @ptrCast(&out_f16), &.{});
+    quant.quant(.mxfp4, .f16, in, @ptrCast(&out_f16), &.{});
     for (want, out_f16) |w, got| try std.testing.expectEqual(
         @as(u16, @bitCast(@as(f16, @floatCast(w)))),
         @as(u16, @bitCast(got)),
     );
 
     var out_bf16: [64]u16 = undefined;
-    dequant.dequant(.mxfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
+    quant.quant(.mxfp4, .bf16, in, @ptrCast(&out_bf16), &.{});
     for (want, out_bf16) |w, got| try std.testing.expectEqual(
         @as(u16, @truncate(@as(u32, @bitCast(w)) >> 16)),
         got,
