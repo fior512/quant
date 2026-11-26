@@ -3,7 +3,7 @@ Quantization and dequantization for `.safetensors` in Zig (0.17)
 
 gpt-oss-20b (`openai/gpt-oss-20b`, 12.8 GiB, MXFP4 experts) on Ryzen 5 7600X:
 
-| out_scheme | 1t | 6t | 12t | file GB/s (6t) |
+| out dtype | 1t | 6t | 12t | file GB/s (6t) |
 |---|---|---|---|---|
 | nvfp4 | 6920 ms | 1450 ms | 1190 ms | 9.5 |
 | mxfp4 | 960 ms | 370 ms | 360 ms | 37.2 |
