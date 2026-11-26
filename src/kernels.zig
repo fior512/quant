@@ -64,7 +64,7 @@ pub inline fn unpack(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
     }
 }
 
-// decode for E_M_ types
+
 pub inline fn decode(comptime out_t: types.Dtype.Recipe, comptime count: usize, values: anytype) @Vector(count, f32) {
     const Lanes = @Vector(count, u32);
     const Floats = @Vector(count, f32);
@@ -121,6 +121,7 @@ pub inline fn decode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
 }
 
 
+
 pub inline fn encode(comptime out_t: types.Dtype.Recipe, comptime count: usize, values: @Vector(count, f32)) @Vector(count, u32) {
     const Lanes = @Vector(count, u32);
     const Floats = @Vector(count, f32);
@@ -165,10 +166,20 @@ pub inline fn encode(comptime out_t: types.Dtype.Recipe, comptime count: usize, 
 
 
 pub fn tableTranslate(comptime out_t: types.Dtype.Recipe) [1 << out_t.bits]f32 {
-    //Produce a lookup table that will be used by both loadScale() and decode()
+    //Produce a lookup table for fast decode
     @setEvalBranchQuota(1_000_000);
     const t_size = 1 << out_t.bits;
     var values: [t_size]u8 = undefined;
     for (&values, 0..) |*element , idx| element.* = @intCast(idx);
     return comptime decode(out_t, t_size, values);
+}
+
+pub inline fn absMax(comptime count: usize, values: @Vector(count, f32)) f32 {
+    const Ints = @Vector(count, i32);
+    const inf_bits: Ints = @splat(@bitCast(std.math.inf(f32)));
+    const nan_bits: Ints = @splat(@bitCast(-std.math.nan(f32)));
+
+    const magnitudes: Ints = @bitCast(@abs(values));
+    const ordered = @select(i32, magnitudes > inf_bits, nan_bits, magnitudes);
+    return @abs(@as(f32, @bitCast(@reduce(.Max, ordered))));
 }
